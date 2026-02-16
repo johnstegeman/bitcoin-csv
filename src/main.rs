@@ -26,7 +26,7 @@
 use anyhow::{Context, Result};
 use bitcoin::Network;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -34,7 +34,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use bitcoin_chain_graph::config::{Config, ConfigLoader};
 use bitcoin_chain_graph::domain::{IngestionOrchestrator, ShutdownHeightTracker};
 use bitcoin_chain_graph::parser::{RpcBlockProvider, SingleBlockLoader, ZmqBlockListener};
-use bitcoin_chain_graph::writer::{Neo4jWriter, WriterError};
+use bitcoin_chain_graph::writer::{CsvWriter, GraphWriter, Neo4jWriter, WriterError};
 
 /// Bitcoin Chain Graph - Blockchain ingestion into Neo4j
 #[derive(Parser)]
@@ -51,6 +51,14 @@ struct Cli {
         default_value = "config/default.toml"
     )]
     config: PathBuf,
+
+    /// Writer type: "neo4j" or "csv" (default: "neo4j")
+    #[arg(long, global = true, value_name = "TYPE", default_value = "neo4j")]
+    writer: String,
+
+    /// Output directory for CSV files (required when writer=csv)
+    #[arg(long, global = true, value_name = "DIR")]
+    csv_output_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -101,12 +109,52 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&config);
 
+    // Validate writer type
+    let writer_type = cli.writer.to_lowercase();
+    if writer_type != "neo4j" && writer_type != "csv" {
+        anyhow::bail!(
+            "Invalid writer type: {}. Must be 'neo4j' or 'csv'",
+            cli.writer
+        );
+    }
+
+    // Validate CSV output directory if using CSV writer
+    if writer_type == "csv" && cli.csv_output_dir.is_none() {
+        anyhow::bail!("--csv-output-dir is required when --writer=csv");
+    }
+
     match cli.command {
-        Commands::InitSchema => init_schema(&config).await,
-        Commands::Ingest { max_height } => ingest(&config, max_height).await,
-        Commands::Resume { max_height } => resume(&config, max_height).await,
-        Commands::Status => status(&config).await,
-        Commands::Live { max_height } => run_live_ingestion(&config, max_height).await,
+        Commands::InitSchema => {
+            init_schema(&config, &writer_type, cli.csv_output_dir.as_deref()).await
+        }
+        Commands::Ingest { max_height } => {
+            ingest(
+                &config,
+                max_height,
+                &writer_type,
+                cli.csv_output_dir.as_deref(),
+            )
+            .await
+        }
+        Commands::Resume { max_height } => {
+            resume(
+                &config,
+                max_height,
+                &writer_type,
+                cli.csv_output_dir.as_deref(),
+            )
+            .await
+        }
+        Commands::Status => status(&config, &writer_type, cli.csv_output_dir.as_deref()).await,
+        Commands::Live { max_height } => {
+            run_live_ingestion(
+                &config,
+                max_height,
+                &writer_type,
+                cli.csv_output_dir.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -149,27 +197,59 @@ fn init_logging(config: &Config) {
     );
 }
 
-/// Initialize Neo4j schema and create initial checkpoint
-async fn init_schema(config: &Config) -> Result<()> {
+/// Initialize schema and create initial checkpoint
+async fn init_schema(
+    config: &Config,
+    writer_type: &str,
+    csv_output_dir: Option<&Path>,
+) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  Initialize Neo4j Schema                                       ║");
+    if writer_type == "csv" {
+        println!("║  Initialize CSV Export Schema                                  ║");
+    } else {
+        println!("║  Initialize Neo4j Schema                                       ║");
+    }
     println!("╚════════════════════════════════════════════════════════════════╝\n");
 
-    println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
-    let writer = Neo4jWriter::new(config.neo4j.clone())
-        .await
-        .context("Failed to connect to Neo4j")?;
-    println!("   ✅ Connected successfully");
-
     let cache_size = config.performance.cache_capacity();
-    let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
 
-    println!("\n🏗️  Initializing schema (constraints + indexes)...");
-    orchestrator
-        .init_schema()
-        .await
-        .context("Failed to initialize schema")?;
-    println!("   ✅ Schema initialized");
+    match writer_type {
+        "neo4j" => {
+            println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
+            let writer = Neo4jWriter::new(config.neo4j.clone())
+                .await
+                .context("Failed to connect to Neo4j")?;
+            println!("   ✅ Connected successfully");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
+
+            println!("\n🏗️  Initializing schema...");
+            orchestrator
+                .init_schema()
+                .await
+                .context("Failed to initialize schema")?;
+            println!("   ✅ Schema initialized");
+        }
+        "csv" => {
+            let output_dir =
+                csv_output_dir.context("CSV output directory is required when using CSV writer")?;
+            println!("📁 Initializing CSV writer at {:?}...", output_dir);
+            let writer = CsvWriter::new(output_dir)
+                .await
+                .context("Failed to create CSV writer")?;
+            println!("   ✅ CSV writer initialized");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
+
+            println!("\n🏗️  Initializing schema...");
+            orchestrator
+                .init_schema()
+                .await
+                .context("Failed to initialize schema")?;
+            println!("   ✅ Schema initialized");
+        }
+        _ => anyhow::bail!("Invalid writer type: {}", writer_type),
+    }
 
     println!("\n✅ Initialization complete!");
     println!("\nNext steps:");
@@ -180,26 +260,55 @@ async fn init_schema(config: &Config) -> Result<()> {
 }
 
 /// Start fresh ingestion from genesis block (streaming mode)
-async fn ingest(config: &Config, cli_max_height: Option<u32>) -> Result<()> {
+async fn ingest(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    writer_type: &str,
+    csv_output_dir: Option<&Path>,
+) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Start Fresh Ingestion (Streaming Mode)                       ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
 
-    // Connect to Neo4j
-    println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
-    let writer = Neo4jWriter::new(config.neo4j.clone())
-        .await
-        .context("Failed to connect to Neo4j")?;
-    println!("   ✅ Connected successfully");
+    let cache_size = config.performance.cache_capacity();
 
-    // Create orchestrator
-    let orchestrator = IngestionOrchestrator::new(
-        writer,
-        Network::Bitcoin,
-        config.performance.cache_capacity(),
-    )
-    .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+    match writer_type {
+        "neo4j" => {
+            println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
+            let writer = Neo4jWriter::new(config.neo4j.clone())
+                .await
+                .context("Failed to connect to Neo4j")?;
+            println!("   ✅ Connected successfully");
 
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_ingest_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        "csv" => {
+            let output_dir =
+                csv_output_dir.context("CSV output directory is required when using CSV writer")?;
+            println!("📁 Initializing CSV writer at {:?}...", output_dir);
+            let writer = CsvWriter::new(output_dir)
+                .await
+                .context("Failed to create CSV writer")?;
+            println!("   ✅ CSV writer initialized");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_ingest_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        _ => anyhow::bail!("Invalid writer type: {}", writer_type),
+    }
+}
+
+/// Common ingestion logic that works with any writer type
+async fn run_ingest_with_orchestrator<W: GraphWriter + 'static>(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    orchestrator: IngestionOrchestrator<W>,
+) -> Result<()> {
     // Check if schema is initialized
     let checkpoint = orchestrator
         .get_checkpoint()
@@ -255,26 +364,55 @@ async fn ingest(config: &Config, cli_max_height: Option<u32>) -> Result<()> {
 }
 
 /// Resume ingestion from last checkpoint (streaming with pre-warming)
-async fn resume(config: &Config, cli_max_height: Option<u32>) -> Result<()> {
+async fn resume(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    writer_type: &str,
+    csv_output_dir: Option<&Path>,
+) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Resume Ingestion (Streaming with Pre-warming)                ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
 
-    // Connect to Neo4j
-    println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
-    let writer = Neo4jWriter::new(config.neo4j.clone())
-        .await
-        .context("Failed to connect to Neo4j")?;
-    println!("   ✅ Connected successfully");
+    let cache_size = config.performance.cache_capacity();
 
-    // Create orchestrator
-    let orchestrator = IngestionOrchestrator::new(
-        writer,
-        Network::Bitcoin,
-        config.performance.cache_capacity(),
-    )
-    .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+    match writer_type {
+        "neo4j" => {
+            println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
+            let writer = Neo4jWriter::new(config.neo4j.clone())
+                .await
+                .context("Failed to connect to Neo4j")?;
+            println!("   ✅ Connected successfully");
 
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_resume_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        "csv" => {
+            let output_dir = csv_output_dir
+                .context("CSV output directory is required when using CSV writer")?;
+            println!("📁 Initializing CSV writer at {:?}...", output_dir);
+            let writer = CsvWriter::new(output_dir)
+                .await
+                .context("Failed to create CSV writer")?;
+            println!("   ✅ CSV writer initialized");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_resume_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        _ => anyhow::bail!("Invalid writer type: {}", writer_type),
+    }
+}
+
+/// Common resume logic that works with any writer type
+async fn run_resume_with_orchestrator<W: GraphWriter + 'static>(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    orchestrator: IngestionOrchestrator<W>,
+) -> Result<()> {
     // Get checkpoint
     let checkpoint = orchestrator
         .get_checkpoint()
@@ -351,9 +489,9 @@ async fn resume(config: &Config, cli_max_height: Option<u32>) -> Result<()> {
 }
 
 /// Core streaming ingestion function with optional cache pre-warming
-async fn run_streaming_ingestion(
+async fn run_streaming_ingestion<W: GraphWriter + 'static>(
     config: &Config,
-    orchestrator: IngestionOrchestrator<Neo4jWriter>,
+    orchestrator: IngestionOrchestrator<W>,
     mut loader: SingleBlockLoader,
     start_height: u32,
     max_height: u32,
@@ -558,20 +696,44 @@ async fn run_streaming_ingestion(
 }
 
 /// Display checkpoint status and progress
-async fn status(config: &Config) -> Result<()> {
+async fn status(
+    config: &Config,
+    writer_type: &str,
+    csv_output_dir: Option<&Path>,
+) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Checkpoint Status                                             ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
 
-    // Connect to Neo4j
-    println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
-    let writer = Neo4jWriter::new(config.neo4j.clone())
-        .await
-        .context("Failed to connect to Neo4j")?;
-
     let cache_size = config.performance.cache_capacity();
-    let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
 
+    match writer_type {
+        "neo4j" => {
+            println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
+            let writer = Neo4jWriter::new(config.neo4j.clone())
+                .await
+                .context("Failed to connect to Neo4j")?;
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
+            run_status_with_orchestrator(orchestrator).await
+        }
+        "csv" => {
+            let output_dir =
+                csv_output_dir.context("CSV output directory is required when using CSV writer")?;
+            println!("📁 Initializing CSV writer at {:?}...", output_dir);
+            let writer = CsvWriter::new(output_dir)
+                .await
+                .context("Failed to create CSV writer")?;
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size);
+            run_status_with_orchestrator(orchestrator).await
+        }
+        _ => anyhow::bail!("Invalid writer type: {}", writer_type),
+    }
+}
+
+/// Common status logic that works with any writer type
+async fn run_status_with_orchestrator<W: GraphWriter + 'static>(
+    orchestrator: IngestionOrchestrator<W>,
+) -> Result<()> {
     // Get checkpoint
     let checkpoint = orchestrator
         .get_checkpoint()
@@ -620,7 +782,12 @@ async fn status(config: &Config) -> Result<()> {
 }
 
 /// Live ingestion: catch up via RPC then stream new blocks via ZMQ
-async fn run_live_ingestion(config: &Config, cli_max_height: Option<u32>) -> Result<()> {
+async fn run_live_ingestion(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    writer_type: &str,
+    csv_output_dir: Option<&Path>,
+) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Live Mode: RPC Catchup + ZMQ Real-Time                      ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
@@ -629,25 +796,51 @@ async fn run_live_ingestion(config: &Config, cli_max_height: Option<u32>) -> Res
     config
         .validate_rpc()
         .context("RPC configuration validation failed for live mode")?;
+
+    let cache_size = config.performance.cache_capacity();
+
+    match writer_type {
+        "neo4j" => {
+            println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
+            let writer = Neo4jWriter::new(config.neo4j.clone())
+                .await
+                .context("Failed to connect to Neo4j")?;
+            println!("   ✅ Connected to Neo4j");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_live_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        "csv" => {
+            let output_dir =
+                csv_output_dir.context("CSV output directory is required when using CSV writer")?;
+            println!("📁 Initializing CSV writer at {:?}...", output_dir);
+            let writer = CsvWriter::new(output_dir)
+                .await
+                .context("Failed to create CSV writer")?;
+            println!("   ✅ CSV writer initialized");
+
+            let orchestrator = IngestionOrchestrator::new(writer, Network::Bitcoin, cache_size)
+                .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
+
+            run_live_with_orchestrator(config, cli_max_height, orchestrator).await
+        }
+        _ => anyhow::bail!("Invalid writer type: {}", writer_type),
+    }
+}
+
+/// Common live ingestion logic that works with any writer type
+async fn run_live_with_orchestrator<W: GraphWriter + 'static>(
+    config: &Config,
+    cli_max_height: Option<u32>,
+    orchestrator: IngestionOrchestrator<W>,
+) -> Result<()> {
+    // Validate RPC config
     let rpc_config = config
         .bitcoin_rpc
         .as_ref()
         .context("[bitcoin_rpc] section missing from config file. Required for live mode.")?;
-
-    // Connect to Neo4j
-    println!("🔌 Connecting to Neo4j at {}...", config.neo4j.uri);
-    let writer = Neo4jWriter::new(config.neo4j.clone())
-        .await
-        .context("Failed to connect to Neo4j")?;
-    println!("   ✅ Connected to Neo4j");
-
-    // Create orchestrator (same as ingest/resume)
-    let orchestrator = IngestionOrchestrator::new(
-        writer,
-        Network::Bitcoin,
-        config.performance.cache_capacity(),
-    )
-    .with_max_transaction_memory_mb(config.ingestion.max_transaction_memory_mb);
 
     // Wire up snapshot path so orchestrator saves after each committed batch
     let cache_file = &config.performance.utxo_cache_file;
@@ -1161,8 +1354,8 @@ fn format_eta(secs: f64) -> String {
 
 /// Used during chain reorganization handling to determine how far back
 /// to roll back before re-ingesting the canonical chain.
-async fn find_fork_point(
-    orchestrator: &IngestionOrchestrator<Neo4jWriter>,
+async fn find_fork_point<W: GraphWriter + 'static>(
+    orchestrator: &IngestionOrchestrator<W>,
     provider: &RpcBlockProvider,
     start_height: u32,
 ) -> Result<u32> {

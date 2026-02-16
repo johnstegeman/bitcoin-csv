@@ -8,6 +8,7 @@
 //! - `traits::GraphWriter` - Database abstraction trait
 //! - `mock::MockWriter` - In-memory implementation for testing
 //! - `neo4j::Neo4jWriter` - Production Neo4j implementation
+//! - `csv::CsvWriter` - CSV file export implementation
 //! - `error::WriterError` - Error types for writer operations
 //!
 //! # Example
@@ -21,11 +22,13 @@
 //! }
 //! ```
 
+pub mod csv;
 mod error;
 pub mod mock;
 pub mod neo4j;
 mod traits;
 
+pub use csv::CsvWriter;
 pub use error::{Result, WriterError};
 pub use mock::MockWriter;
 pub use neo4j::Neo4jWriter;
