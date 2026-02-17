@@ -17,6 +17,9 @@ use crate::domain::{
 };
 use crate::writer::{GraphWriter, Result, WriterError};
 
+/// Default buffer size for file writers (512 KB). Larger buffers reduce syscalls.
+const DEFAULT_BUFFER_CAPACITY: usize = 512 * 1024;
+
 /// CSV writer that writes blockchain data to CSV files
 ///
 /// Creates one CSV file per node label:
@@ -85,7 +88,10 @@ impl CsvWriter {
                     ))
                 })?;
 
-            writers.insert(file_path.to_path_buf(), BufWriter::new(file));
+            writers.insert(
+                file_path.to_path_buf(),
+                BufWriter::with_capacity(DEFAULT_BUFFER_CAPACITY, file),
+            );
         }
 
         Ok(())
@@ -135,15 +141,27 @@ impl CsvWriter {
         Ok(())
     }
 
-    /// Write a CSV row to a file
-    async fn write_row(&self, file_path: &Path, row: &[String]) -> Result<()> {
+    /// Write many CSV rows in a single lock and syscall. Much faster than per-row writes.
+    async fn write_rows_batch(&self, file_path: &Path, rows: &[Vec<String>]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         self.get_writer(file_path).await?;
+
+        let body: String = rows
+            .iter()
+            .map(|row| row.join(","))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
 
         let mut writers = self.writers.lock().await;
         if let Some(writer) = writers.get_mut(file_path) {
-            let row_line = row.join(",") + "\n";
-            writer.write_all(row_line.as_bytes()).await.map_err(|e| {
-                WriterError::DatabaseError(format!("Failed to write row to {:?}: {}", file_path, e))
+            writer.write_all(body.as_bytes()).await.map_err(|e| {
+                WriterError::DatabaseError(format!(
+                    "Failed to write batch to {:?}: {}",
+                    file_path, e
+                ))
             })?;
         }
 
@@ -213,43 +231,45 @@ impl GraphWriter for CsvWriter {
         )
         .await?;
 
-        // Write blocks
-        for block in blocks {
-            let row = vec![
-                block.height.to_string(),
-                Self::escape_csv_field(&block.hash),
-                Self::escape_csv_field(&block.previous_hash),
-                Self::escape_csv_field(&block.merkle_root),
-                block.timestamp.to_string(),
-                Self::escape_csv_field(&block.bits),
-                block.difficulty.to_string(),
-                block.nonce.to_string(),
-                block.version.to_string(),
-                block.tx_count.to_string(),
-                block.size.to_string(),
-                block.weight.to_string(),
-            ];
-            self.write_row(&file_path, &row).await?;
-        }
+        // Write blocks (batched)
+        let block_rows: Vec<Vec<String>> = blocks
+            .iter()
+            .map(|block| {
+                vec![
+                    block.height.to_string(),
+                    Self::escape_csv_field(&block.hash),
+                    Self::escape_csv_field(&block.previous_hash),
+                    Self::escape_csv_field(&block.merkle_root),
+                    block.timestamp.to_string(),
+                    Self::escape_csv_field(&block.bits),
+                    block.difficulty.to_string(),
+                    block.nonce.to_string(),
+                    block.version.to_string(),
+                    block.tx_count.to_string(),
+                    block.size.to_string(),
+                    block.weight.to_string(),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&file_path, &block_rows).await?;
 
-        // Write NEXT_BLOCK relationships
+        // Write NEXT_BLOCK relationships (batched)
         let rel_file_path = self.output_dir.join("NEXT_BLOCK.csv");
         self.write_headers_if_needed(&rel_file_path, &["from_hash", "to_hash"])
             .await?;
 
-        for block in blocks {
-            if block.height > 0 {
-                // Find previous block hash (we need to look it up from the blocks we're writing)
-                // For now, we'll use the previous_hash field directly
-                let row = vec![
+        let next_block_rows: Vec<Vec<String>> = blocks
+            .iter()
+            .filter(|b| b.height > 0)
+            .map(|block| {
+                vec![
                     Self::escape_csv_field(&block.previous_hash),
                     Self::escape_csv_field(&block.hash),
-                ];
-                self.write_row(&rel_file_path, &row).await?;
-            }
-        }
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&rel_file_path, &next_block_rows).await?;
 
-        self.flush_all().await?;
         Ok(())
     }
 
@@ -281,40 +301,45 @@ impl GraphWriter for CsvWriter {
         )
         .await?;
 
-        // Write transactions
-        for tx in transactions {
-            let row = vec![
-                Self::escape_csv_field(&tx.txid),
-                tx.block_height.to_string(),
-                Self::escape_csv_field(&tx.block_hash),
-                tx.timestamp.to_string(),
-                tx.version.to_string(),
-                tx.locktime.to_string(),
-                tx.size.to_string(),
-                tx.vsize.to_string(),
-                tx.weight.to_string(),
-                tx.is_coinbase.to_string(),
-                Self::format_optional(&tx.total_input),
-                Self::format_optional(&tx.total_output),
-                Self::format_optional(&tx.fee),
-            ];
-            self.write_row(&file_path, &row).await?;
-        }
+        // Write transactions (batched)
+        let tx_rows: Vec<Vec<String>> = transactions
+            .iter()
+            .map(|tx| {
+                vec![
+                    Self::escape_csv_field(&tx.txid),
+                    tx.block_height.to_string(),
+                    Self::escape_csv_field(&tx.block_hash),
+                    tx.timestamp.to_string(),
+                    tx.version.to_string(),
+                    tx.locktime.to_string(),
+                    tx.size.to_string(),
+                    tx.vsize.to_string(),
+                    tx.weight.to_string(),
+                    tx.is_coinbase.to_string(),
+                    Self::format_optional(&tx.total_input),
+                    Self::format_optional(&tx.total_output),
+                    Self::format_optional(&tx.fee),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&file_path, &tx_rows).await?;
 
-        // Write INCLUDED_IN relationships
+        // Write INCLUDED_IN relationships (batched)
         let rel_file_path = self.output_dir.join("INCLUDED_IN.csv");
         self.write_headers_if_needed(&rel_file_path, &["from_txid", "to_block_hash"])
             .await?;
 
-        for tx in transactions {
-            let row = vec![
-                Self::escape_csv_field(&tx.txid),
-                Self::escape_csv_field(&tx.block_hash),
-            ];
-            self.write_row(&rel_file_path, &row).await?;
-        }
+        let included_in_rows: Vec<Vec<String>> = transactions
+            .iter()
+            .map(|tx| {
+                vec![
+                    Self::escape_csv_field(&tx.txid),
+                    Self::escape_csv_field(&tx.block_hash),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&rel_file_path, &included_in_rows).await?;
 
-        self.flush_all().await?;
         Ok(())
     }
 
@@ -340,21 +365,24 @@ impl GraphWriter for CsvWriter {
         )
         .await?;
 
-        // Write outputs
-        for output in outputs {
-            let row = vec![
-                Self::escape_csv_field(&output.output_id),
-                output.output_index.to_string(),
-                Self::escape_csv_field(&output.txid),
-                output.amount.to_string(),
-                Self::escape_csv_field(&output.script_pubkey),
-                Self::escape_csv_field(&output.script_type),
-                Self::format_optional(&output.address),
-            ];
-            self.write_row(&file_path, &row).await?;
-        }
+        // Write outputs (batched)
+        let output_rows: Vec<Vec<String>> = outputs
+            .iter()
+            .map(|output| {
+                vec![
+                    Self::escape_csv_field(&output.output_id),
+                    output.output_index.to_string(),
+                    Self::escape_csv_field(&output.txid),
+                    output.amount.to_string(),
+                    Self::escape_csv_field(&output.script_pubkey),
+                    Self::escape_csv_field(&output.script_type),
+                    Self::format_optional(&output.address),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&file_path, &output_rows).await?;
 
-        // Write LOCKED_TO relationships and Address nodes
+        // Write LOCKED_TO relationships and Address nodes (batched)
         let rel_file_path = self.output_dir.join("LOCKED_TO.csv");
         self.write_headers_if_needed(&rel_file_path, &["from_outputId", "to_address"])
             .await?;
@@ -364,26 +392,28 @@ impl GraphWriter for CsvWriter {
             .await?;
 
         let mut seen_addresses = std::collections::HashSet::new();
+        let mut addr_rows = Vec::new();
+        let mut locked_to_rows = Vec::new();
 
         for output in outputs {
             if let Some(ref address) = output.address {
-                // Write Address node if not seen before
-                if !seen_addresses.contains(address) {
-                    let row = vec![Self::escape_csv_field(address)];
-                    self.write_row(&addr_file_path, &row).await?;
-                    seen_addresses.insert(address.clone());
+                if seen_addresses.insert(address.clone()) {
+                    addr_rows.push(vec![Self::escape_csv_field(address)]);
                 }
-
-                // Write LOCKED_TO relationship
-                let row = vec![
+                locked_to_rows.push(vec![
                     Self::escape_csv_field(&output.output_id),
                     Self::escape_csv_field(address),
-                ];
-                self.write_row(&rel_file_path, &row).await?;
+                ]);
             }
         }
 
-        self.flush_all().await?;
+        if !addr_rows.is_empty() {
+            self.write_rows_batch(&addr_file_path, &addr_rows).await?;
+        }
+        if !locked_to_rows.is_empty() {
+            self.write_rows_batch(&rel_file_path, &locked_to_rows).await?;
+        }
+
         Ok(())
     }
 
@@ -396,15 +426,17 @@ impl GraphWriter for CsvWriter {
         self.write_headers_if_needed(&rel_file_path, &["from_txid", "to_outputId"])
             .await?;
 
-        for output in outputs {
-            let row = vec![
-                Self::escape_csv_field(&output.txid),
-                Self::escape_csv_field(&output.output_id),
-            ];
-            self.write_row(&rel_file_path, &row).await?;
-        }
+        let has_output_rows: Vec<Vec<String>> = outputs
+            .iter()
+            .map(|output| {
+                vec![
+                    Self::escape_csv_field(&output.txid),
+                    Self::escape_csv_field(&output.output_id),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&rel_file_path, &has_output_rows).await?;
 
-        self.flush_all().await?;
         Ok(())
     }
 
@@ -432,61 +464,65 @@ impl GraphWriter for CsvWriter {
         )
         .await?;
 
-        // Write inputs
-        for input in inputs {
-            // Format witness as comma-separated values (or empty)
-            let witness_str = if input.witness.is_empty() {
-                String::new()
-            } else {
-                input.witness.join(";") // Use semicolon as separator since comma is CSV delimiter
-            };
+        // Write inputs (batched)
+        let input_rows: Vec<Vec<String>> = inputs
+            .iter()
+            .map(|input| {
+                let witness_str = if input.witness.is_empty() {
+                    String::new()
+                } else {
+                    input.witness.join(";")
+                };
+                vec![
+                    Self::escape_csv_field(&input.input_id),
+                    input.input_index.to_string(),
+                    Self::escape_csv_field(&input.txid),
+                    Self::escape_csv_field(&input.previous_txid),
+                    input.previous_output_index.to_string(),
+                    Self::escape_csv_field(&input.script_sig),
+                    input.sequence.to_string(),
+                    Self::escape_csv_field(&witness_str),
+                    input.block_height.to_string(),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&file_path, &input_rows).await?;
 
-            let row = vec![
-                Self::escape_csv_field(&input.input_id),
-                input.input_index.to_string(),
-                Self::escape_csv_field(&input.txid),
-                Self::escape_csv_field(&input.previous_txid),
-                input.previous_output_index.to_string(),
-                Self::escape_csv_field(&input.script_sig),
-                input.sequence.to_string(),
-                Self::escape_csv_field(&witness_str),
-                input.block_height.to_string(),
-            ];
-            self.write_row(&file_path, &row).await?;
-        }
-
-        // Write HAS_INPUT relationships
+        // Write HAS_INPUT relationships (batched)
         let has_input_file_path = self.output_dir.join("HAS_INPUT.csv");
         self.write_headers_if_needed(&has_input_file_path, &["from_txid", "to_inputId"])
             .await?;
 
-        for input in inputs {
-            let row = vec![
-                Self::escape_csv_field(&input.txid),
-                Self::escape_csv_field(&input.input_id),
-            ];
-            self.write_row(&has_input_file_path, &row).await?;
-        }
+        let has_input_rows: Vec<Vec<String>> = inputs
+            .iter()
+            .map(|input| {
+                vec![
+                    Self::escape_csv_field(&input.txid),
+                    Self::escape_csv_field(&input.input_id),
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&has_input_file_path, &has_input_rows).await?;
 
-        // Write SPENDS relationships (skip coinbase inputs)
+        // Write SPENDS relationships (batched, skip coinbase)
         let spends_file_path = self.output_dir.join("SPENDS.csv");
         self.write_headers_if_needed(&spends_file_path, &["from_inputId", "to_outputId"])
             .await?;
 
-        for input in inputs {
-            // Skip coinbase inputs (previous_output_index = 0xFFFFFFFF = 4294967295)
-            if input.previous_output_index != 0xFFFFFFFF {
+        let spends_rows: Vec<Vec<String>> = inputs
+            .iter()
+            .filter(|i| i.previous_output_index != 0xFFFFFFFF)
+            .map(|input| {
                 let previous_output_id =
                     format!("{}:{}", input.previous_txid, input.previous_output_index);
-                let row = vec![
+                vec![
                     Self::escape_csv_field(&input.input_id),
                     Self::escape_csv_field(&previous_output_id),
-                ];
-                self.write_row(&spends_file_path, &row).await?;
-            }
-        }
+                ]
+            })
+            .collect();
+        self.write_rows_batch(&spends_file_path, &spends_rows).await?;
 
-        self.flush_all().await?;
         Ok(())
     }
 
@@ -508,26 +544,26 @@ impl GraphWriter for CsvWriter {
             .await?;
 
         let mut seen_addresses = std::collections::HashSet::new();
+        let mut addr_rows = Vec::new();
+        let mut performs_rows = Vec::new();
 
         for perform in performs {
-            // Write Address node if not seen before
-            if !seen_addresses.contains(&perform.from_address) {
-                let row = vec![Self::escape_csv_field(&perform.from_address)];
-                self.write_row(&addr_file_path, &row).await?;
-                seen_addresses.insert(perform.from_address.clone());
+            if seen_addresses.insert(perform.from_address.clone()) {
+                addr_rows.push(vec![Self::escape_csv_field(&perform.from_address)]);
             }
-
-            // Write PERFORMS relationship
-            let row = vec![
+            performs_rows.push(vec![
                 Self::escape_csv_field(&perform.from_address),
                 Self::escape_csv_field(&perform.to_txid),
                 perform.input_count.to_string(),
                 perform.amount_spent.to_string(),
-            ];
-            self.write_row(&rel_file_path, &row).await?;
+            ]);
         }
 
-        self.flush_all().await?;
+        if !addr_rows.is_empty() {
+            self.write_rows_batch(&addr_file_path, &addr_rows).await?;
+        }
+        self.write_rows_batch(&rel_file_path, &performs_rows).await?;
+
         Ok(())
     }
 
@@ -549,26 +585,26 @@ impl GraphWriter for CsvWriter {
             .await?;
 
         let mut seen_addresses = std::collections::HashSet::new();
+        let mut addr_rows = Vec::new();
+        let mut benefits_rows = Vec::new();
 
         for benefit in benefits_to {
-            // Write Address node if not seen before
-            if !seen_addresses.contains(&benefit.to_address) {
-                let row = vec![Self::escape_csv_field(&benefit.to_address)];
-                self.write_row(&addr_file_path, &row).await?;
-                seen_addresses.insert(benefit.to_address.clone());
+            if seen_addresses.insert(benefit.to_address.clone()) {
+                addr_rows.push(vec![Self::escape_csv_field(&benefit.to_address)]);
             }
-
-            // Write BENEFITS_TO relationship
-            let row = vec![
+            benefits_rows.push(vec![
                 Self::escape_csv_field(&benefit.from_txid),
                 Self::escape_csv_field(&benefit.to_address),
                 benefit.output_count.to_string(),
                 benefit.amount_received.to_string(),
-            ];
-            self.write_row(&rel_file_path, &row).await?;
+            ]);
         }
 
-        self.flush_all().await?;
+        if !addr_rows.is_empty() {
+            self.write_rows_batch(&addr_file_path, &addr_rows).await?;
+        }
+        self.write_rows_batch(&rel_file_path, &benefits_rows).await?;
+
         Ok(())
     }
 
