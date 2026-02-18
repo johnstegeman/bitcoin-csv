@@ -23,10 +23,10 @@
 //! - Startup time: 2-5 min → 15 sec (12-30x faster)
 
 use bitcoin::{consensus::deserialize, Block, Network};
+use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use super::block_index::{BlockIndexReader, IndexError};
@@ -121,6 +121,13 @@ struct BlockLocation {
 /// Batch size for index pre-loading (number of blocks to load in one scan)
 const INDEX_BATCH_SIZE: u32 = 500;
 
+/// Cached mmap for the current .blk file. Reused when loading consecutive blocks from the same file
+/// to avoid opening the file and mapping it for every single block.
+struct CachedBlkFile {
+    _file: File,
+    mmap: Mmap,
+}
+
 pub struct SingleBlockLoader {
     blocks_dir: PathBuf,
     network: Network,
@@ -128,6 +135,8 @@ pub struct SingleBlockLoader {
     block_index: HashMap<u32, BlockLocation>,
     /// Block index reader for lazy loading
     reader: BlockIndexReader,
+    /// Cached open file + mmap for the last-used .blk file. Reused when the next block is in the same file.
+    cached_file: Option<(PathBuf, CachedBlkFile)>,
 }
 
 impl SingleBlockLoader {
@@ -176,7 +185,26 @@ impl SingleBlockLoader {
             network,
             block_index: HashMap::new(), // Empty - will be populated on-demand
             reader,
+            cached_file: None,
         })
+    }
+
+    /// Ensure the given .blk file is in the mmap cache (open and map if not already cached).
+    /// Reuses the cached file when the path matches, avoiding repeated open/mmap for sequential blocks.
+    fn ensure_mmap_cached(&mut self, file_path: &PathBuf) -> Result<()> {
+        if let Some((ref cached_path, _)) = &self.cached_file {
+            if cached_path == file_path {
+                return Ok(());
+            }
+        }
+        let file = File::open(file_path)?;
+        // SAFETY: We hold the file in CachedBlkFile and only read. Map is valid for the file's lifetime.
+        let mmap = unsafe { Mmap::map(&file)? };
+        self.cached_file = Some((
+            file_path.clone(),
+            CachedBlkFile { _file: file, mmap },
+        ));
+        Ok(())
     }
 
     /// Pre-load a batch of block locations from the index (batch optimization)
@@ -328,23 +356,20 @@ impl SingleBlockLoader {
     /// Returns error if file can't be opened or block can't be parsed
     ///
     /// # Performance
-    /// - First call for a height: ~100ms (index lookup + file read)
-    /// - Subsequent calls: Instant (cached location + file read)
+    /// - Index: O(1) after preload; first batch may load index.
+    /// - File I/O: Reuses a cached mmap when consecutive blocks are in the same .blk file
+    ///   (one open+mmap per file instead of per block). Deserialize is zero-copy from the mmap.
     pub fn load_block(&mut self, height: u32) -> Result<Option<(u32, Block, String)>> {
         // Ensure block location is loaded (lazy loading)
         self.ensure_loaded(height)?;
 
-        // Check if height exists in cache after lazy load
-        let location = match self.block_index.get(&height) {
-            Some(loc) => loc,
-            None => {
-                // Block not found even after index lookup - beyond chain tip
-                return Ok(None);
-            }
+        // Copy location data so we don't hold block_index borrow across ensure_mmap_cached
+        let (file_number, file_offset) = match self.block_index.get(&height) {
+            Some(loc) => (loc.file_number, loc.file_offset),
+            None => return Ok(None),
         };
 
-        // Construct file path
-        let file_name = format!("blk{:05}.dat", location.file_number);
+        let file_name = format!("blk{:05}.dat", file_number);
         let file_path = self.blocks_dir.join(&file_name);
 
         if !file_path.exists() {
@@ -354,40 +379,50 @@ impl SingleBlockLoader {
             )));
         }
 
-        // Open file and seek to block offset
-        // Bitcoin Core's file_offset points to block data start (after magic+size)
-        // We need to read magic (4B) + size (4B) first, so seek 8 bytes before
-        let mut file = File::open(&file_path)?;
-        let header_offset = location.file_offset.saturating_sub(8);
-        file.seek(SeekFrom::Start(header_offset))?;
+        self.ensure_mmap_cached(&file_path)?;
+        let mmap = &self.cached_file.as_ref().unwrap().1.mmap;
+        let header_offset = file_offset.saturating_sub(8) as usize;
 
-        // Read magic bytes (4 bytes)
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
-
-        // Verify magic matches network
-        let expected_magic = self.network.magic().to_bytes();
-        if magic != expected_magic {
+        if header_offset + 8 > mmap.len() {
             return Err(LoaderError::ParseError(format!(
-                "Invalid magic bytes at height {}: expected {:?}, got {:?}",
-                height, expected_magic, magic
+                "Block at height {}: header offset {} + 8 beyond file length {}",
+                height, header_offset, mmap.len()
             )));
         }
 
-        // Read block size (4 bytes)
-        let mut size_bytes = [0u8; 4];
-        file.read_exact(&mut size_bytes)?;
-        let block_size = u32::from_le_bytes(size_bytes);
+        // Magic (4) + size (4)
+        let magic_slice = &mmap[header_offset..header_offset + 4];
+        let expected_magic = self.network.magic().to_bytes();
+        if magic_slice != expected_magic.as_slice() {
+            return Err(LoaderError::ParseError(format!(
+                "Invalid magic bytes at height {}: expected {:?}, got {:?}",
+                height, expected_magic, magic_slice
+            )));
+        }
 
-        // Note: Bitcoin Core's LevelDB index doesn't store block_size (always 0 in our struct)
-        // so we can't validate it. We trust the size from the file.
+        let block_size = u32::from_le_bytes(
+            mmap[header_offset + 4..header_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
-        // Read block data
-        let mut block_data = vec![0u8; block_size as usize];
-        file.read_exact(&mut block_data)?;
+        if block_size == 0 || block_size > 4_000_000 {
+            return Err(LoaderError::ParseError(format!(
+                "Invalid block size {} at height {}",
+                block_size, height
+            )));
+        }
 
-        // Deserialize block
-        let block: Block = deserialize(&block_data)?;
+        if header_offset + 8 + block_size > mmap.len() {
+            return Err(LoaderError::ParseError(format!(
+                "Block at height {}: block size {} extends beyond file length {}",
+                height, block_size, mmap.len()
+            )));
+        }
+
+        // Zero-copy: deserialize directly from mmap slice (no vec allocation)
+        let block_data = &mmap[header_offset + 8..header_offset + 8 + block_size];
+        let block: Block = deserialize(block_data)?;
 
         Ok(Some((height, block, file_name)))
     }
