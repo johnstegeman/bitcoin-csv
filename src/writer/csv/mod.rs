@@ -39,6 +39,13 @@ const DEFAULT_BUFFER_CAPACITY: usize = 512 * 1024;
 /// - LOCKED_TO.csv
 /// - PERFORMS.csv
 /// - BENEFITS_TO.csv
+/// Cached (height, hash) for the last block written in this process.
+/// Used to avoid re-reading Block.csv on every parent-hash validation during sequential ingestion.
+struct LastBlockCache(Option<(u32, String)>);
+
+/// Cached checkpoint for this process so we don't re-read IngestionCheckpoint.csv after updates.
+struct CheckpointCache(Option<CheckpointData>);
+
 pub struct CsvWriter {
     /// Base directory for CSV files
     output_dir: PathBuf,
@@ -46,6 +53,10 @@ pub struct CsvWriter {
     initialized_files: Arc<Mutex<HashMap<PathBuf, bool>>>,
     /// Map of file paths to their BufWriter handles
     writers: Arc<Mutex<HashMap<PathBuf, BufWriter<File>>>>,
+    /// Last block (height, hash) written in this run; avoids full Block.csv read in lookup_block_hash
+    last_block: Arc<Mutex<LastBlockCache>>,
+    /// In-memory checkpoint so get_checkpoint/update_checkpoint don't re-read the file
+    checkpoint_cache: Arc<Mutex<CheckpointCache>>,
 }
 
 impl CsvWriter {
@@ -68,6 +79,8 @@ impl CsvWriter {
             output_dir,
             initialized_files: Arc::new(Mutex::new(HashMap::new())),
             writers: Arc::new(Mutex::new(HashMap::new())),
+            last_block: Arc::new(Mutex::new(LastBlockCache(None))),
+            checkpoint_cache: Arc::new(Mutex::new(CheckpointCache(None))),
         })
     }
 
@@ -268,7 +281,14 @@ impl GraphWriter for CsvWriter {
                 ]
             })
             .collect();
-        self.write_rows_batch(&rel_file_path, &next_block_rows).await?;
+        self.write_rows_batch(&rel_file_path, &next_block_rows)
+            .await?;
+
+        // Cache last block so lookup_block_hash can avoid reading Block.csv during sequential ingestion
+        if let Some(last) = blocks.last() {
+            let mut cache = self.last_block.lock().await;
+            cache.0 = Some((last.height, last.hash.clone()));
+        }
 
         Ok(())
     }
@@ -338,7 +358,8 @@ impl GraphWriter for CsvWriter {
                 ]
             })
             .collect();
-        self.write_rows_batch(&rel_file_path, &included_in_rows).await?;
+        self.write_rows_batch(&rel_file_path, &included_in_rows)
+            .await?;
 
         Ok(())
     }
@@ -411,7 +432,8 @@ impl GraphWriter for CsvWriter {
             self.write_rows_batch(&addr_file_path, &addr_rows).await?;
         }
         if !locked_to_rows.is_empty() {
-            self.write_rows_batch(&rel_file_path, &locked_to_rows).await?;
+            self.write_rows_batch(&rel_file_path, &locked_to_rows)
+                .await?;
         }
 
         Ok(())
@@ -435,7 +457,8 @@ impl GraphWriter for CsvWriter {
                 ]
             })
             .collect();
-        self.write_rows_batch(&rel_file_path, &has_output_rows).await?;
+        self.write_rows_batch(&rel_file_path, &has_output_rows)
+            .await?;
 
         Ok(())
     }
@@ -502,7 +525,8 @@ impl GraphWriter for CsvWriter {
                 ]
             })
             .collect();
-        self.write_rows_batch(&has_input_file_path, &has_input_rows).await?;
+        self.write_rows_batch(&has_input_file_path, &has_input_rows)
+            .await?;
 
         // Write SPENDS relationships (batched, skip coinbase)
         let spends_file_path = self.output_dir.join("SPENDS.csv");
@@ -521,7 +545,8 @@ impl GraphWriter for CsvWriter {
                 ]
             })
             .collect();
-        self.write_rows_batch(&spends_file_path, &spends_rows).await?;
+        self.write_rows_batch(&spends_file_path, &spends_rows)
+            .await?;
 
         Ok(())
     }
@@ -562,7 +587,8 @@ impl GraphWriter for CsvWriter {
         if !addr_rows.is_empty() {
             self.write_rows_batch(&addr_file_path, &addr_rows).await?;
         }
-        self.write_rows_batch(&rel_file_path, &performs_rows).await?;
+        self.write_rows_batch(&rel_file_path, &performs_rows)
+            .await?;
 
         Ok(())
     }
@@ -603,7 +629,8 @@ impl GraphWriter for CsvWriter {
         if !addr_rows.is_empty() {
             self.write_rows_batch(&addr_file_path, &addr_rows).await?;
         }
-        self.write_rows_batch(&rel_file_path, &benefits_rows).await?;
+        self.write_rows_batch(&rel_file_path, &benefits_rows)
+            .await?;
 
         Ok(())
     }
@@ -675,10 +702,20 @@ impl GraphWriter for CsvWriter {
             WriterError::DatabaseError(format!("Failed to flush checkpoint: {}", e))
         })?;
 
+        let mut cache = self.checkpoint_cache.lock().await;
+        cache.0 = Some(checkpoint.clone());
+
         Ok(())
     }
 
     async fn get_checkpoint(&self) -> Result<Option<CheckpointData>> {
+        {
+            let cache = self.checkpoint_cache.lock().await;
+            if let Some(ref cp) = cache.0 {
+                return Ok(Some(cp.clone()));
+            }
+        }
+
         let file_path = self.output_dir.join("IngestionCheckpoint.csv");
 
         if !file_path.exists() {
@@ -721,6 +758,10 @@ impl GraphWriter for CsvWriter {
                         timestamp: record[4].parse().unwrap_or(0),
                         status: record[5].to_string(),
                     };
+                    {
+                        let mut cache = self.checkpoint_cache.lock().await;
+                        cache.0 = Some(checkpoint.clone());
+                    }
                     return Ok(Some(checkpoint));
                 }
             }
@@ -800,13 +841,22 @@ impl GraphWriter for CsvWriter {
     }
 
     async fn lookup_block_hash(&self, height: u32) -> Result<Option<String>> {
+        {
+            let cache = self.last_block.lock().await;
+            if let Some((cached_height, ref hash)) = cache.0 {
+                if cached_height == height {
+                    return Ok(Some(hash.clone()));
+                }
+            }
+        }
+
         let file_path = self.output_dir.join("Block.csv");
 
         if !file_path.exists() {
             return Ok(None);
         }
 
-        // Read blocks from CSV
+        // Read blocks from CSV (only when not in cache, e.g. resume or rollback)
         let content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| WriterError::DatabaseError(format!("Failed to read Block.csv: {}", e)))?;

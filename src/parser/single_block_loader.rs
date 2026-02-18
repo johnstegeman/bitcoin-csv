@@ -200,10 +200,7 @@ impl SingleBlockLoader {
         let file = File::open(file_path)?;
         // SAFETY: We hold the file in CachedBlkFile and only read. Map is valid for the file's lifetime.
         let mmap = unsafe { Mmap::map(&file)? };
-        self.cached_file = Some((
-            file_path.clone(),
-            CachedBlkFile { _file: file, mmap },
-        ));
+        self.cached_file = Some((file_path.clone(), CachedBlkFile { _file: file, mmap }));
         Ok(())
     }
 
@@ -247,8 +244,7 @@ impl SingleBlockLoader {
         // Evict entries for heights we've already passed. We read sequentially, so we never
         // need them again. This keeps block_index bounded (~INDEX_BATCH_SIZE entries) and
         // prevents slowdown as ingestion runs (no unbounded HashMap growth or repeated rehashing).
-        self.block_index
-            .retain(|&k, _| k >= start_height);
+        self.block_index.retain(|&k, _| k >= start_height);
 
         tracing::debug!(
             blocks_loaded = count,
@@ -393,7 +389,9 @@ impl SingleBlockLoader {
         if header_offset + 8 > mmap.len() {
             return Err(LoaderError::ParseError(format!(
                 "Block at height {}: header offset {} + 8 beyond file length {}",
-                height, header_offset, mmap.len()
+                height,
+                header_offset,
+                mmap.len()
             )));
         }
 
@@ -423,7 +421,9 @@ impl SingleBlockLoader {
         if header_offset + 8 + block_size > mmap.len() {
             return Err(LoaderError::ParseError(format!(
                 "Block at height {}: block size {} extends beyond file length {}",
-                height, block_size, mmap.len()
+                height,
+                block_size,
+                mmap.len()
             )));
         }
 

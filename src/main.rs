@@ -390,8 +390,8 @@ async fn resume(
             run_resume_with_orchestrator(config, cli_max_height, orchestrator).await
         }
         "csv" => {
-            let output_dir = csv_output_dir
-                .context("CSV output directory is required when using CSV writer")?;
+            let output_dir =
+                csv_output_dir.context("CSV output directory is required when using CSV writer")?;
             println!("📁 Initializing CSV writer at {:?}...", output_dir);
             let writer = CsvWriter::new(output_dir)
                 .await
@@ -696,11 +696,7 @@ async fn run_streaming_ingestion<W: GraphWriter + 'static>(
 }
 
 /// Display checkpoint status and progress
-async fn status(
-    config: &Config,
-    writer_type: &str,
-    csv_output_dir: Option<&Path>,
-) -> Result<()> {
+async fn status(config: &Config, writer_type: &str, csv_output_dir: Option<&Path>) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Checkpoint Status                                             ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
