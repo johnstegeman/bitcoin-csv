@@ -4,7 +4,9 @@
 //! This enables easy data export and analysis without requiring a Neo4j database.
 
 use async_trait::async_trait;
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
@@ -19,6 +21,10 @@ use crate::writer::{GraphWriter, Result, WriterError};
 
 /// Default buffer size for file writers (512 KB). Larger buffers reduce syscalls.
 const DEFAULT_BUFFER_CAPACITY: usize = 512 * 1024;
+
+/// Max outputs to keep in memory for lookup_outputs_batch so we can avoid reading Output.csv.
+/// When the UTXO cache has misses, we check this first; only true misses trigger a file read.
+const RECENT_OUTPUTS_CAPACITY: usize = 5_000_000;
 
 /// CSV writer that writes blockchain data to CSV files
 ///
@@ -57,6 +63,8 @@ pub struct CsvWriter {
     last_block: Arc<Mutex<LastBlockCache>>,
     /// In-memory checkpoint so get_checkpoint/update_checkpoint don't re-read the file
     checkpoint_cache: Arc<Mutex<CheckpointCache>>,
+    /// Recently written outputs (and results from file reads) to avoid full Output.csv scans
+    recent_outputs: Arc<Mutex<LruCache<String, OutputLookupResult>>>,
 }
 
 impl CsvWriter {
@@ -81,6 +89,9 @@ impl CsvWriter {
             writers: Arc::new(Mutex::new(HashMap::new())),
             last_block: Arc::new(Mutex::new(LastBlockCache(None))),
             checkpoint_cache: Arc::new(Mutex::new(CheckpointCache(None))),
+            recent_outputs: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(RECENT_OUTPUTS_CAPACITY).expect("RECENT_OUTPUTS_CAPACITY > 0"),
+            ))),
         })
     }
 
@@ -402,6 +413,21 @@ impl GraphWriter for CsvWriter {
             })
             .collect();
         self.write_rows_batch(&file_path, &output_rows).await?;
+
+        // Populate recent_outputs so lookup_outputs_batch can resolve these without reading Output.csv
+        {
+            let mut cache = self.recent_outputs.lock().await;
+            for output in outputs {
+                let lookup = OutputLookupResult {
+                    output_id: output.output_id.clone(),
+                    output_index: output.output_index,
+                    amount: output.amount,
+                    script_type: output.script_type.clone(),
+                    address: output.address.clone(),
+                };
+                cache.put(output.output_id.clone(), lookup);
+            }
+        }
 
         // Write LOCKED_TO relationships and Address nodes (batched)
         let rel_file_path = self.output_dir.join("LOCKED_TO.csv");
@@ -795,13 +821,31 @@ impl GraphWriter for CsvWriter {
     }
 
     async fn lookup_outputs_batch(&self, output_ids: &[String]) -> Result<Vec<OutputLookupResult>> {
-        let file_path = self.output_dir.join("Output.csv");
+        let mut results = Vec::with_capacity(output_ids.len());
+        let mut misses = Vec::new();
 
-        if !file_path.exists() {
-            return Ok(Vec::new());
+        {
+            let mut cache = self.recent_outputs.lock().await;
+            for id in output_ids {
+                if let Some(lookup) = cache.get(id) {
+                    results.push(lookup.clone());
+                } else {
+                    misses.push(id.clone());
+                }
+            }
         }
 
-        // Read all outputs from CSV
+        if misses.is_empty() {
+            return Ok(results);
+        }
+
+        let file_path = self.output_dir.join("Output.csv");
+        if !file_path.exists() {
+            return Ok(results);
+        }
+
+        // Read Output.csv only for IDs not in recent_outputs cache
+        let requested_set: std::collections::HashSet<String> = misses.iter().cloned().collect();
         let content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| WriterError::DatabaseError(format!("Failed to read Output.csv: {}", e)))?;
@@ -810,9 +854,7 @@ impl GraphWriter for CsvWriter {
             .has_headers(true)
             .from_reader(content.as_bytes());
 
-        let mut results = Vec::new();
-        let requested_set: std::collections::HashSet<String> = output_ids.iter().cloned().collect();
-
+        let mut file_results = Vec::new();
         for result in reader.records() {
             let record = result.map_err(|e| {
                 WriterError::DatabaseError(format!("Failed to parse Output.csv: {}", e))
@@ -821,7 +863,7 @@ impl GraphWriter for CsvWriter {
             if record.len() >= 7 {
                 let output_id = record[0].to_string();
                 if requested_set.contains(&output_id) {
-                    let output = OutputLookupResult {
+                    let lookup = OutputLookupResult {
                         output_id: output_id.clone(),
                         output_index: record[1].parse().unwrap_or(0),
                         amount: record[3].parse().unwrap_or(0),
@@ -832,11 +874,20 @@ impl GraphWriter for CsvWriter {
                             Some(record[6].to_string())
                         },
                     };
-                    results.push(output);
+                    file_results.push(lookup);
                 }
             }
         }
 
+        // Insert file results into cache so future lookups may avoid reading the file
+        {
+            let mut cache = self.recent_outputs.lock().await;
+            for r in &file_results {
+                cache.put(r.output_id.clone(), r.clone());
+            }
+        }
+
+        results.extend(file_results);
         Ok(results)
     }
 
