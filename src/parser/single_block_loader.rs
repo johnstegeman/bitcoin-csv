@@ -244,8 +244,15 @@ impl SingleBlockLoader {
             );
         }
 
+        // Evict entries for heights we've already passed. We read sequentially, so we never
+        // need them again. This keeps block_index bounded (~INDEX_BATCH_SIZE entries) and
+        // prevents slowdown as ingestion runs (no unbounded HashMap growth or repeated rehashing).
+        self.block_index
+            .retain(|&k, _| k >= start_height);
+
         tracing::debug!(
             blocks_loaded = count,
+            index_size = self.block_index.len(),
             elapsed_ms = batch_start.elapsed().as_millis(),
             "Index batch loaded"
         );
